@@ -20,8 +20,11 @@ CHANNEL_ID  = os.getenv("CHANNEL_ID", "")   # -100... or @publicusername
 MODE        = os.getenv("MODE", "polling").lower()
 
 # Your preferred emojis; we’ll intersect with what the channel allows
-EMOJIS      = [e.strip() for e in os.getenv("EMOJIS", "👍").split(",") if e.strip()]
+EMOJIS      = [e.strip() for e in os.getenv("EMOJIS", "👍,🔥,😀").split(",") if e.strip()]
 CUSTOM_IDS  = [c.strip() for c in os.getenv("CUSTOM_EMOJI_IDS", "").split(",") if c.strip()]
+
+# How many reactions to set per message (Telegram may still limit per actor)
+MAX_REACTIONS = max(1, int(os.getenv("MAX_REACTIONS", "3")))
 
 PORT        = int(os.getenv("PORT", "3000"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
@@ -44,9 +47,6 @@ def normalize_emoji(e: str) -> str:
     # Normalize red heart forms
     return "❤️" if e == "❤" else e
 
-def build_reactions_list(emojis: List[str]) -> List[ReactionTypeEmoji]:
-    return [ReactionTypeEmoji(normalize_emoji(e)) for e in emojis]
-
 def matches_target_channel(update: Update) -> bool:
     msg = update.effective_message
     if not msg:
@@ -55,6 +55,27 @@ def matches_target_channel(update: Update) -> bool:
         uname = msg.chat.username
         return ("@" + uname) == CHANNEL_ID if uname else False
     return str(msg.chat.id) == str(CHANNEL_ID)
+
+def is_reactable(msg) -> bool:
+    # Skip service/automatic/system posts
+    if getattr(msg, "is_automatic_forward", False):
+        return False
+    if getattr(msg, "pinned_message", None):
+        return False  # pin event, not real content
+    # Consider “real” content
+    return any([
+        bool(getattr(msg, "text", None)),
+        bool(getattr(msg, "caption", None)),
+        bool(getattr(msg, "photo", None)),
+        bool(getattr(msg, "video", None)),
+        bool(getattr(msg, "animation", None)),
+        bool(getattr(msg, "document", None)),
+        bool(getattr(msg, "audio", None)),
+        bool(getattr(msg, "voice", None)),
+        bool(getattr(msg, "video_note", None)),
+        bool(getattr(msg, "sticker", None)),
+        bool(getattr(msg, "poll", None)),
+    ])
 
 async def get_allowed_for_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Optional[Dict[str, Set[str]]]:
     """
@@ -85,76 +106,117 @@ async def get_allowed_for_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
         return None
 
     for r in reactions:
-        if isinstance(r, ReactionTypeEmoji) and getattr(r, "emoji", None):
+        # r may be ReactionTypeEmoji or ReactionTypeCustomEmoji
+        if hasattr(r, "emoji") and r.emoji:
             std.add(normalize_emoji(r.emoji))
-        elif isinstance(r, ReactionTypeCustomEmoji) and getattr(r, "custom_emoji_id", None):
+        elif hasattr(r, "custom_emoji_id") and r.custom_emoji_id:
             custom.add(r.custom_emoji_id)
 
     data = {"std": std, "custom": custom}
     allowed_cache[chat_id] = data
     return data
 
-async def pick_allowed_emoji(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Optional[Any]:
+def unique_preserve_order(items: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for x in items:
+        if x not in seen:
+            out.append(x)
+            seen.add(x)
+    return out
+
+async def pick_allowed_reactions(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    k: int
+) -> List[Any]:
     """
-    Pick one allowed reaction for this chat:
-      - Prefer intersection of EMOJIS ∩ allowed standard emojis
-      - Else any allowed standard emoji
-      - Else try a custom emoji from CUSTOM_IDS that’s allowed
-    Returns a ReactionTypeEmoji or ReactionTypeCustomEmoji, or None.
+    Build up to k allowed ReactionType* for this chat:
+      1) Use intersection of EMOJIS ∩ allowed standard
+      2) If not enough, add other allowed standard
+      3) If still short, add allowed custom emoji ids from CUSTOM_IDS
     """
     allowed = await get_allowed_for_chat(context, chat_id)
 
-    # All allowed: pick from your preferred list
+    # Preferred list normalized & unique
+    preferred_std = unique_preserve_order([normalize_emoji(e) for e in EMOJIS])
+
     if allowed is None:
-        return ReactionTypeEmoji(normalize_emoji(random.choice(EMOJIS)))
+        # All allowed; take up to k from preferred list (randomized)
+        pool = preferred_std[:]
+        random.shuffle(pool)
+        chosen = pool[:k]
+        return [ReactionTypeEmoji(e) for e in chosen]
 
     std_allowed = list(allowed.get("std", set()))
     custom_allowed = list(allowed.get("custom", set()))
 
-    # Intersect preferred with allowed standard
-    preferred_std = [e for e in EMOJIS if normalize_emoji(e) in allowed.get("std", set())]
-    if preferred_std:
-        return ReactionTypeEmoji(normalize_emoji(random.choice(preferred_std)))
+    # 1) Intersection with preferred
+    intersect = [e for e in preferred_std if e in allowed.get("std", set())]
+    random.shuffle(intersect)
 
-    # If no intersection, but some standard allowed, pick one of those
-    if std_allowed:
-        return ReactionTypeEmoji(random.choice(std_allowed))
+    chosen: List[Any] = [ReactionTypeEmoji(e) for e in intersect[:k]]
 
-    # If only custom emojis are allowed & you provided IDs, try those
-    usable_custom = [cid for cid in CUSTOM_IDS if cid in custom_allowed]
-    if usable_custom:
-        return ReactionTypeCustomEmoji(custom_emoji_id=random.choice(usable_custom))
+    # 2) Fill with other allowed standard
+    if len(chosen) < k and std_allowed:
+        extra_std = [e for e in std_allowed if e not in [rt.emoji for rt in chosen if hasattr(rt, "emoji")]]
+        random.shuffle(extra_std)
+        for e in extra_std:
+            if len(chosen) >= k:
+                break
+            chosen.append(ReactionTypeEmoji(e))
 
-    # Nothing usable
-    return None
+    # 3) Fill with allowed custom ids from CUSTOM_IDS
+    if len(chosen) < k and custom_allowed and CUSTOM_IDS:
+        usable_custom = [cid for cid in CUSTOM_IDS if cid in custom_allowed]
+        random.shuffle(usable_custom)
+        for cid in usable_custom:
+            if len(chosen) >= k:
+                break
+            chosen.append(ReactionTypeCustomEmoji(custom_emoji_id=cid))
+
+    return chosen[:k]
 
 # -------- Handler --------
 async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not msg or not matches_target_channel(update):
         return
+    if not is_reactable(msg):
+        return
 
-    reaction_type = await pick_allowed_emoji(context, msg.chat.id)
-    if reaction_type is None:
-        log.warning("No allowed reaction found for chat %s; skipping.", msg.chat.id)
+    # Try multiple reactions
+    reactions = await pick_allowed_reactions(context, msg.chat.id, MAX_REACTIONS)
+    if not reactions:
+        log.warning("No allowed reactions found for chat %s; skipping.", msg.chat.id)
         return
 
     try:
-        # Send ONE reaction (bots typically can set one reaction per message)
         await context.bot.set_message_reaction(
             chat_id=msg.chat.id,
             message_id=msg.message_id,
-            reaction=[reaction_type],
-            is_big=False,  # set True if you want the big animation
+            reaction=reactions,
+            is_big=False,  # True for big animation
         )
-        log.info("Reacted to message_id=%s in chat_id=%s", msg.message_id, msg.chat.id)
+        log.info("Reacted (x%s) to message_id=%s in chat_id=%s", len(reactions), msg.message_id, msg.chat.id)
     except Exception as e:
-        log.error("Failed to react: %s", e)
+        # Fallback: try just one (some chats limit per-actor to one)
+        log.warning("Multi-reaction failed (%s). Falling back to single.", e)
+        try:
+            await context.bot.set_message_reaction(
+                chat_id=msg.chat.id,
+                message_id=msg.message_id,
+                reaction=[reactions[0]],
+                is_big=False,
+            )
+            log.info("Reacted (fallback single) to message_id=%s in chat_id=%s", msg.message_id, msg.chat.id)
+        except Exception as e2:
+            log.error("Failed to react even with single: %s", e2)
 
 def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Channel posts come as channel messages; this filter captures them
+    # Channel posts come as messages in channel chats
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, on_channel_post))
 
     if MODE == "webhook":
