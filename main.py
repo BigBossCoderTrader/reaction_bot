@@ -1,84 +1,58 @@
-import os
-import logging
-from typing import List
-from dotenv import load_dotenv
-from telegram import Update, ReactionTypeEmoji, ReactionTypeCustomEmoji
-from telegram.ext import Application, ContextTypes, MessageHandler, filters
+import { Telegraf } from "telegraf";
 
-# ---------- Setup ----------
-load_dotenv()
-BOT_TOKEN   = os.getenv("BOT_TOKEN", "")
-CHANNEL_ID  = os.getenv("CHANNEL_ID", "")
-MODE        = os.getenv("MODE", "polling").lower()
+// Your own pool (we'll intersect with what's allowed in the chat)
+const PREFERRED = ["👍","❤️","🔥","🥰","👏","😁","🤔","🎉","💯","🤣","🙏","😍","👌","😎","🤩"];
 
-EMOJIS      = [e.strip() for e in os.getenv("EMOJIS", "👍").split(",") if e.strip()]
-CUSTOM_IDS  = [c.strip() for c in os.getenv("CUSTOM_EMOJI_IDS", "").split(",") if c.strip()]
-PORT        = int(os.getenv("PORT", "3000"))
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
+const normalize = (e) => e === "❤" ? "❤️" : e; // normalize red heart
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is required in .env")
+// cache allowed reactions per chat
+const allowedCache = new Map();
 
-logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
-log = logging.getLogger("reaction-bot")
+/** Returns an array of standard emoji allowed in this chat, or null if all are allowed */
+async function getAllowedEmoji(bot, chatId) {
+  if (allowedCache.has(chatId)) return allowedCache.get(chatId);
 
+  // Bot API: getChat -> ChatFullInfo may include available_reactions (list of ReactionType)
+  const chat = await bot.telegram.callApi("getChat", { chat_id: chatId });
+  const ar = chat.available_reactions; // may be omitted => all emoji allowed
+  let allowed = null;
 
-# ---------- Helpers ----------
-def build_reactions() -> List:
-    r = [ReactionTypeEmoji(e) for e in EMOJIS]
-    r += [ReactionTypeCustomEmoji(custom_emoji_id=c) for c in CUSTOM_IDS]
-    return r
+  if (Array.isArray(ar)) {
+    // keep only standard emoji reactions (ignore custom emoji ids)
+    allowed = ar
+      .filter((r) => r.type === "emoji" && r.emoji)
+      .map((r) => normalize(r.emoji));
+  }
 
-def matches_target_channel(update: Update) -> bool:
-    msg = update.effective_message
-    if not msg:
-        return False
-    if CHANNEL_ID.startswith("@"):
-        uname = msg.chat.username
-        return ("@" + uname) == CHANNEL_ID if uname else False
-    return str(msg.chat.id) == str(CHANNEL_ID)
+  allowedCache.set(chatId, allowed);
+  return allowed;
+}
 
+export function setup(bot) {
+  // IMPORTANT: channel posts come as 'channel_post', not 'message'
+  bot.on("channel_post", async (ctx) => {
+    try {
+      const chatId = ctx.chat.id;
+      const messageId = ctx.channelPost.message_id;
 
-# ---------- Handler ----------
-async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
-    if not msg or not matches_target_channel(update):
-        return
-    reactions = build_reactions()
-    try:
-        await context.bot.set_message_reaction(
-            chat_id=msg.chat.id,
-            message_id=msg.message_id,
-            reaction=reactions,
-            is_big=False,
-        )
-        log.info("Reacted to message_id=%s in chat_id=%s", msg.message_id, msg.chat.id)
-    except Exception as e:
-        log.error("Failed to react: %s", e)
+      // find a reaction that is allowed in this chat
+      const allowed = await getAllowedEmoji(bot, chatId); // null => all allowed
+      const pool = (allowed && allowed.length)
+        ? PREFERRED.filter((e) => allowed.includes(normalize(e)))
+        : PREFERRED;
 
+      // fallback if intersection is empty
+      const pick = (pool.length ? pool : ["👍"])[Math.floor(Math.random() * (pool.length || 1))];
 
-# ---------- Main ----------
-def main() -> None:
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    # Catch new messages in channels
-    app.add_handler(MessageHandler(filters.ChatType.CHANNEL, on_channel_post))
-
-    if MODE == "webhook":
-        if not WEBHOOK_URL:
-            raise RuntimeError("WEBHOOK_URL is required when MODE=webhook")
-        log.info("Starting webhook: %s (port %s)", WEBHOOK_URL, PORT)
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path="",
-            webhook_url=WEBHOOK_URL,
-            allowed_updates=["channel_post"],
-        )
-    else:
-        log.info("Starting polling…")
-        app.run_polling(allowed_updates=["channel_post"], poll_interval=1.0)
-
-
-if __name__ == "__main__":
-    main()
+      // Correct shape: reaction array + top-level is_big
+      await ctx.telegram.callApi("setMessageReaction", {
+        chat_id: chatId,
+        message_id: messageId,
+        reaction: [{ type: "emoji", emoji: normalize(pick) }],
+        is_big: true
+      });
+    } catch (error) {
+      console.error("Error setting reaction:", error);
+    }
+  });
+}
