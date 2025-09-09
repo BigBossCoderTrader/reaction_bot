@@ -4,9 +4,7 @@ from typing import List
 
 from dotenv import load_dotenv
 from telegram import Update, ReactionTypeEmoji, ReactionTypeCustomEmoji
-from telegram.ext import (
-    Application, ContextTypes, ChannelPostHandler
-)
+from telegram.ext import Application, ContextTypes, ChannelPostHandler
 
 # ---------- Setup ----------
 load_dotenv()
@@ -48,11 +46,10 @@ def matches_target_channel(update: Update) -> bool:
     if not post:
         return False
 
-    # Accept numeric -100... id OR @username string
-    if CHANNEL_ID.startswith("@"):
+    if CHANNEL_ID.startswith("@"):  # for public channels
         username = post.chat.username
         return ("@" + username) == CHANNEL_ID if username else False
-    else:
+    else:  # for private channels (-100…)
         return str(post.chat.id) == str(CHANNEL_ID)
 
 
@@ -83,7 +80,7 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # ---------- Main ----------
 def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(ChannelPostHandler(on_channel_post))  # listens for new channel posts
+    app.add_handler(ChannelPostHandler(on_channel_post))
 
     if MODE == "webhook":
         if not WEBHOOK_URL:
@@ -92,7 +89,7 @@ def main() -> None:
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
-            url_path="",                 # use WEBHOOK_URL as full path
+            url_path="",                 # full WEBHOOK_URL used
             webhook_url=WEBHOOK_URL,
             allowed_updates=["channel_post"],
         )
