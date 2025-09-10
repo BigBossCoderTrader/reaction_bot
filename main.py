@@ -1,7 +1,7 @@
 from telegram import Update, ReactionTypeEmoji
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+BOT_TOKEN = "8435629423:AAFwtgLuifZdvcLchm18fA9lqtVpq6_Y9NU"
 
 async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.channel_post
